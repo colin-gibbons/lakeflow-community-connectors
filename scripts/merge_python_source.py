@@ -120,6 +120,7 @@ def deduplicate_imports(import_lists: List[List[str]]) -> List[str]:
     # Imports to skip (internal imports that won't work in merged file)
     skip_patterns = [
         "from libs.utils import",
+        "from libs.graphql_utils import",
         "from pipeline.lakeflow_python_source import",
         "from sources.",
     ]
@@ -299,6 +300,7 @@ def merge_files(source_name: str, output_path: Optional[Path] = None) -> str:
 
     # Define file paths
     utils_path = project_root / "libs" / "utils.py"
+    graphql_utils_path = project_root / "libs" / "graphql_utils.py"
     source_path = project_root / "sources" / source_name / f"{source_name}.py"
     lakeflow_source_path = project_root / "pipeline" / "lakeflow_python_source.py"
 
@@ -311,9 +313,14 @@ def merge_files(source_name: str, output_path: Optional[Path] = None) -> str:
             / f"_generated_{source_name}_python_source.py"
         )
 
+    # Check if graphql_utils.py exists
+    has_graphql_utils = graphql_utils_path.exists()
+
     # Verify all files exist
     print(f"Merging files for source: {source_name}", file=sys.stderr)
     print(f"- utils.py: {utils_path}", file=sys.stderr)
+    if has_graphql_utils:
+        print(f"- graphql_utils.py: {graphql_utils_path}", file=sys.stderr)
     print(f"- {source_name}.py: {source_path}", file=sys.stderr)
     print(f"- lakeflow_python_source.py: {lakeflow_source_path}", file=sys.stderr)
 
@@ -322,6 +329,10 @@ def merge_files(source_name: str, output_path: Optional[Path] = None) -> str:
         utils_content = read_file_content(utils_path)
         source_content = read_file_content(source_path)
         lakeflow_source_content = read_file_content(lakeflow_source_path)
+
+        graphql_utils_content = None
+        if has_graphql_utils:
+            graphql_utils_content = read_file_content(graphql_utils_path)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -331,8 +342,16 @@ def merge_files(source_name: str, output_path: Optional[Path] = None) -> str:
     source_imports, source_code = extract_imports_and_code(source_content)
     lakeflow_imports, lakeflow_code = extract_imports_and_code(lakeflow_source_content)
 
+    import_lists = [utils_imports, source_imports, lakeflow_imports]
+    graphql_utils_imports = []
+    graphql_utils_code = ""
+
+    if has_graphql_utils:
+        graphql_utils_imports, graphql_utils_code = extract_imports_and_code(graphql_utils_content)
+        import_lists.append(graphql_utils_imports)
+
     # Deduplicate and organize all imports
-    all_imports = deduplicate_imports([utils_imports, source_imports, lakeflow_imports])
+    all_imports = deduplicate_imports(import_lists)
 
     # Build the merged content
     merged_lines = []
@@ -375,6 +394,20 @@ def merge_files(source_name: str, output_path: Optional[Path] = None) -> str:
             merged_lines.append("")
     merged_lines.append("")
     merged_lines.append("")
+
+    # Section 1.5: libs/graphql_utils.py code (if exists)
+    if has_graphql_utils:
+        merged_lines.append("    " + "#" * 56)
+        merged_lines.append("    # libs/graphql_utils.py")
+        merged_lines.append("    " + "#" * 56)
+        merged_lines.append("")
+        for line in graphql_utils_code.strip().split("\n"):
+            if line.strip():
+                merged_lines.append("    " + line)
+            else:
+                merged_lines.append("")
+        merged_lines.append("")
+        merged_lines.append("")
 
     # Section 2: sources/{source_name}/{source_name}.py code
     merged_lines.append("    " + "#" * 56)
