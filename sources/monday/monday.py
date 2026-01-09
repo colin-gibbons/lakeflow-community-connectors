@@ -20,7 +20,7 @@ class LakeflowConnect:
     boards, items, and users.
     """
 
-    SUPPORTED_TABLES = ["boards", "items", "users"]
+    SUPPORTED_TABLES = ["boards", "items", "users", "workspaces", "teams", "groups"]
     API_URL = "https://api.monday.com/v2"
     DEFAULT_PAGE_SIZE = 50
     DEFAULT_ACTIVITY_LOG_LIMIT = 1000
@@ -98,6 +98,9 @@ class LakeflowConnect:
             "boards": self._get_boards_schema,
             "items": self._get_items_schema,
             "users": self._get_users_schema,
+            "workspaces": self._get_workspaces_schema,
+            "teams": self._get_teams_schema,
+            "groups": self._get_groups_schema,
         }
 
         return schema_map[table_name]()
@@ -152,6 +155,40 @@ class LakeflowConnect:
             StructField("time_zone_identifier", StringType(), True),
         ])
 
+    def _get_workspaces_schema(self) -> StructType:
+        """Return the workspaces table schema."""
+        return StructType([
+            StructField("id", LongType(), False),
+            StructField("name", StringType(), True),
+            StructField("description", StringType(), True),
+            StructField("kind", StringType(), True),
+            StructField("state", StringType(), True),
+            StructField("created_at", StringType(), True),
+            StructField("is_default_workspace", BooleanType(), True),
+        ])
+
+    def _get_teams_schema(self) -> StructType:
+        """Return the teams table schema."""
+        return StructType([
+            StructField("id", LongType(), False),
+            StructField("name", StringType(), True),
+            StructField("picture_url", StringType(), True),
+            StructField("owner_ids", StringType(), True),  # JSON array of owner user IDs
+            StructField("member_ids", StringType(), True),  # JSON array of member user IDs
+        ])
+
+    def _get_groups_schema(self) -> StructType:
+        """Return the groups table schema."""
+        return StructType([
+            StructField("id", StringType(), False),  # Group IDs are strings
+            StructField("title", StringType(), True),
+            StructField("color", StringType(), True),
+            StructField("position", StringType(), True),
+            StructField("archived", BooleanType(), True),
+            StructField("deleted", BooleanType(), True),
+            StructField("board_id", LongType(), True),  # Parent board ID
+        ])
+
     def read_table_metadata(
         self, table_name: str, table_options: Dict[str, str]
     ) -> dict:
@@ -178,6 +215,18 @@ class LakeflowConnect:
                 "primary_keys": ["id"],
                 "ingestion_type": "snapshot",
             },
+            "workspaces": {
+                "primary_keys": ["id"],
+                "ingestion_type": "snapshot",
+            },
+            "teams": {
+                "primary_keys": ["id"],
+                "ingestion_type": "snapshot",
+            },
+            "groups": {
+                "primary_keys": ["id", "board_id"],
+                "ingestion_type": "snapshot",
+            },
         }
 
         return metadata[table_name]
@@ -194,6 +243,9 @@ class LakeflowConnect:
             "boards": self._read_boards,
             "items": self._read_items,
             "users": self._read_users,
+            "workspaces": self._read_workspaces,
+            "teams": self._read_teams,
+            "groups": self._read_groups,
         }
 
         return read_map[table_name](start_offset, table_options)
@@ -650,6 +702,186 @@ class LakeflowConnect:
             "phone": user.get("phone"),
             "mobile_phone": user.get("mobile_phone"),
             "time_zone_identifier": user.get("time_zone_identifier"),
+        }
+
+    def _read_workspaces(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Read workspaces using page-based pagination.
+        """
+        page_size = int(table_options.get("page_size", self.DEFAULT_PAGE_SIZE))
+        state_filter = table_options.get("state", "all")
+        kind_filter = table_options.get("kind")
+
+        query = """
+        query($limit: Int, $page: Int, $state: State, $kind: WorkspaceKind) {
+            workspaces(limit: $limit, page: $page, state: $state, kind: $kind) {
+                id
+                name
+                description
+                kind
+                state
+                created_at
+                is_default_workspace
+            }
+        }
+        """
+
+        def generate_records():
+            page = 1
+            while True:
+                variables = {
+                    "limit": page_size,
+                    "page": page,
+                    "state": state_filter,
+                }
+                if kind_filter:
+                    variables["kind"] = kind_filter
+
+                data = self._execute_query(query, variables)
+                workspaces = data.get("workspaces", [])
+
+                if not workspaces:
+                    break
+
+                for workspace in workspaces:
+                    yield self._transform_workspace(workspace)
+
+                if len(workspaces) < page_size:
+                    break
+
+                page += 1
+
+        return generate_records(), {}
+
+    def _transform_workspace(self, workspace: dict) -> dict:
+        """Transform a workspace record for output."""
+        return {
+            "id": self._to_long(workspace.get("id")),
+            "name": workspace.get("name"),
+            "description": workspace.get("description"),
+            "kind": workspace.get("kind"),
+            "state": workspace.get("state"),
+            "created_at": workspace.get("created_at"),
+            "is_default_workspace": workspace.get("is_default_workspace"),
+        }
+
+    def _read_teams(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Read teams. Note: Teams API doesn't have pagination parameters,
+        so we fetch all teams in one query.
+        """
+        query = """
+        query {
+            teams {
+                id
+                name
+                picture_url
+                owners {
+                    id
+                }
+                users {
+                    id
+                }
+            }
+        }
+        """
+
+        def generate_records():
+            data = self._execute_query(query)
+            teams = data.get("teams", [])
+
+            for team in teams:
+                yield self._transform_team(team)
+
+        return generate_records(), {}
+
+    def _transform_team(self, team: dict) -> dict:
+        """Transform a team record for output."""
+        owners = team.get("owners") or []
+        users = team.get("users") or []
+
+        # Extract owner and member IDs as JSON arrays
+        owner_ids = json.dumps([self._to_long(o.get("id")) for o in owners if o.get("id")])
+        member_ids = json.dumps([self._to_long(u.get("id")) for u in users if u.get("id")])
+
+        return {
+            "id": self._to_long(team.get("id")),
+            "name": team.get("name"),
+            "picture_url": team.get("picture_url"),
+            "owner_ids": owner_ids,
+            "member_ids": member_ids,
+        }
+
+    def _read_groups(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Read groups from boards. Groups are nested within boards,
+        so we need to query boards and extract their groups.
+
+        Table options:
+            - board_ids: Optional comma-separated list of board IDs.
+                         If not provided, discovers all boards.
+        """
+        board_ids_str = table_options.get("board_ids", "")
+
+        # Get board IDs
+        if board_ids_str:
+            board_ids = [bid.strip() for bid in board_ids_str.split(",") if bid.strip()]
+        else:
+            board_ids = self._discover_board_ids()
+
+        if not board_ids:
+            return iter([]), {}
+
+        query = """
+        query($boardIds: [ID!]) {
+            boards(ids: $boardIds) {
+                id
+                groups {
+                    id
+                    title
+                    color
+                    position
+                    archived
+                    deleted
+                }
+            }
+        }
+        """
+
+        def generate_records():
+            # Process boards in batches to avoid query complexity limits
+            batch_size = 25
+            for i in range(0, len(board_ids), batch_size):
+                batch_ids = board_ids[i:i + batch_size]
+
+                variables = {"boardIds": batch_ids}
+                data = self._execute_query(query, variables)
+
+                for board in data.get("boards", []):
+                    board_id = board.get("id")
+                    groups = board.get("groups", [])
+
+                    for group in groups:
+                        yield self._transform_group(group, board_id)
+
+        return generate_records(), {}
+
+    def _transform_group(self, group: dict, board_id: str) -> dict:
+        """Transform a group record for output."""
+        return {
+            "id": group.get("id"),  # Group IDs are strings
+            "title": group.get("title"),
+            "color": group.get("color"),
+            "position": group.get("position"),
+            "archived": group.get("archived"),
+            "deleted": group.get("deleted"),
+            "board_id": self._to_long(board_id),
         }
 
     @staticmethod

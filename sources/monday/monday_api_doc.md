@@ -48,11 +48,17 @@ The connector supports the following objects (static list):
 | `boards` | None | Boards contain items, columns, groups |
 | `items` | boards | Items are rows within boards |
 | `users` | None | Account users |
+| `workspaces` | None | Workspaces organize boards |
+| `teams` | None | Teams and their members |
+| `groups` | boards | Groups (sections) within boards |
 
 **Object Hierarchy:**
-- `boards` are top-level containers
+- `workspaces` are top-level organizational containers
+- `boards` are top-level containers (may belong to workspaces)
 - `items` belong to `boards` (require board_id to query efficiently)
+- `groups` belong to `boards` (sections that organize items)
 - `users` are independent account-level objects
+- `teams` are independent account-level objects
 
 ## Object Schema
 
@@ -203,6 +209,94 @@ query {
 }
 ```
 
+### workspaces
+
+Queried via GraphQL `workspaces` query.
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | ID! | No | Unique workspace identifier |
+| name | String! | No | Workspace name |
+| description | String | Yes | Workspace description |
+| kind | WorkspaceKind | Yes | Type: `open`, `closed`, `template` |
+| state | State | Yes | State: `active`, `archived`, `deleted` |
+| created_at | Date | Yes | Creation timestamp |
+| is_default_workspace | Boolean | Yes | Whether this is the default workspace |
+
+**Example Query:**
+```graphql
+query {
+  workspaces(limit: 25, page: 1, state: all) {
+    id
+    name
+    description
+    kind
+    state
+    created_at
+    is_default_workspace
+  }
+}
+```
+
+### teams
+
+Queried via GraphQL `teams` query.
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | ID! | No | Unique team identifier |
+| name | String! | No | Team name |
+| picture_url | String | Yes | Team picture URL |
+| owners | [User!]! | No | Team owner users |
+| users | [User] | Yes | Team member users |
+
+**Example Query:**
+```graphql
+query {
+  teams {
+    id
+    name
+    picture_url
+    owners {
+      id
+    }
+    users {
+      id
+    }
+  }
+}
+```
+
+### groups
+
+Queried via GraphQL nested within `boards` query.
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | ID! | No | Unique group identifier (string) |
+| title | String! | No | Group display name |
+| color | String! | No | Group color (hex code) |
+| position | String! | No | Group position on board |
+| archived | Boolean | Yes | Whether the group is archived |
+| deleted | Boolean | Yes | Whether the group is deleted |
+
+**Example Query:**
+```graphql
+query {
+  boards(ids: [1234567890]) {
+    id
+    groups {
+      id
+      title
+      color
+      position
+      archived
+      deleted
+    }
+  }
+}
+```
+
 ## Get Object Primary Keys
 
 Primary keys are static for all objects:
@@ -212,6 +306,9 @@ Primary keys are static for all objects:
 | boards | `id` |
 | items | `id` |
 | users | `id` |
+| workspaces | `id` |
+| teams | `id` |
+| groups | `id`, `board_id` |
 
 All IDs are unique within the Monday.com account.
 
@@ -222,6 +319,9 @@ All IDs are unique within the Monday.com account.
 | boards | `cdc` | Uses Activity Logs API to identify changed boards since last sync |
 | items | `cdc` | Uses Activity Logs API to identify changed items since last sync |
 | users | `snapshot` | No activity log tracking for user changes |
+| workspaces | `snapshot` | No activity log tracking for workspace changes |
+| teams | `snapshot` | No activity log tracking for team changes |
+| groups | `snapshot` | No activity log tracking for group changes |
 
 **Note:** While boards and items have `updated_at` fields, the GraphQL API does not support filtering by these fields directly. The connector uses the Activity Logs API to identify changed entities and then fetches only those records.
 

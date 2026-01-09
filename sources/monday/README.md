@@ -61,6 +61,9 @@ The Monday.com connector supports the following objects:
 | `boards` | id | CDC (Incremental) | Board metadata including name, description, state, and settings |
 | `items` | id | CDC (Incremental) | Items (rows) from boards with all column values |
 | `users` | id | Full Refresh | Account users with profile information |
+| `workspaces` | id | Full Refresh | Workspaces that organize boards |
+| `teams` | id | Full Refresh | Teams and their members |
+| `groups` | id, board_id | Full Refresh | Groups (sections) within boards |
 
 ### Change Data Capture (CDC)
 
@@ -128,6 +131,50 @@ Retrieves all users in the Monday.com account.
 
 **Options:**
 - `kind` - Filter users by type (default: `all`)
+
+### workspaces
+
+Retrieves all workspaces accessible to the authenticated user.
+
+**Key Fields:**
+- `id` - Unique workspace identifier
+- `name` - Workspace name
+- `description` - Workspace description
+- `kind` - Workspace type (open, closed, template)
+- `state` - Workspace state (active, archived, deleted)
+- `created_at` - Creation timestamp
+- `is_default_workspace` - Whether this is the default workspace
+
+**Options:**
+- `state` - Filter by workspace state (default: `all`)
+- `kind` - Filter by workspace type (open, closed, template)
+
+### teams
+
+Retrieves all teams in the Monday.com account.
+
+**Key Fields:**
+- `id` - Unique team identifier
+- `name` - Team name
+- `picture_url` - Team picture URL
+- `owner_ids` - JSON array of owner user IDs
+- `member_ids` - JSON array of member user IDs
+
+### groups
+
+Retrieves groups (sections) from boards. Groups organize items within boards.
+
+**Key Fields:**
+- `id` - Unique group identifier (string)
+- `title` - Group display name
+- `color` - Group color (hex code)
+- `position` - Group position on board
+- `archived` - Whether the group is archived
+- `deleted` - Whether the group is deleted
+- `board_id` - Parent board ID
+
+**Options:**
+- `board_ids` - Comma-separated list of board IDs to fetch groups from. If not specified, discovers all accessible boards.
 
 ## Data Type Mapping
 
