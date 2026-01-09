@@ -64,6 +64,9 @@ The Monday.com connector supports the following objects:
 | `workspaces` | id | Full Refresh | Workspaces that organize boards |
 | `teams` | id | Full Refresh | Teams and their members |
 | `groups` | id, board_id | Full Refresh | Groups (sections) within boards |
+| `tags` | id, board_id | Full Refresh | Tags for categorizing items |
+| `updates` | id | Full Refresh | Comments and updates on items |
+| `activity_logs` | id, board_id | Full Refresh | Audit trail of all board/item changes |
 
 ### Change Data Capture (CDC)
 
@@ -175,6 +178,49 @@ Retrieves groups (sections) from boards. Groups organize items within boards.
 
 **Options:**
 - `board_ids` - Comma-separated list of board IDs to fetch groups from. If not specified, discovers all accessible boards.
+
+### tags
+
+Retrieves tags from boards. Tags are used to categorize and filter items across boards.
+
+**Key Fields:**
+- `id` - Unique tag identifier
+- `name` - Tag name
+- `color` - Tag color
+- `board_id` - Parent board ID
+
+**Options:**
+- `board_ids` - Comma-separated list of board IDs to fetch tags from. If not specified, discovers all accessible boards.
+
+### updates
+
+Retrieves comments and updates posted on items. Updates are the communication threads within Monday.com.
+
+**Key Fields:**
+- `id` - Unique update identifier
+- `body` - HTML-formatted content
+- `text_body` - Plain text content
+- `created_at` - Creation timestamp
+- `updated_at` - Last update timestamp
+- `creator_id` - ID of the user who created the update
+- `item_id` - Parent item ID
+
+### activity_logs
+
+Retrieves the audit trail of all changes made to boards and items. This is the same data source used internally for CDC.
+
+**Key Fields:**
+- `id` - Unique activity log identifier
+- `event` - Action type (e.g., create_pulse, update_column_value)
+- `entity` - Entity type (board or pulse/item)
+- `data` - JSON string with change details
+- `user_id` - ID of the user who performed the action
+- `account_id` - Account identifier
+- `created_at` - Timestamp of the activity
+- `board_id` - Parent board ID
+
+**Options:**
+- `board_ids` - Comma-separated list of board IDs to fetch logs from. If not specified, discovers all accessible boards.
 
 ## Data Type Mapping
 

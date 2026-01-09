@@ -20,7 +20,7 @@ class LakeflowConnect:
     boards, items, and users.
     """
 
-    SUPPORTED_TABLES = ["boards", "items", "users", "workspaces", "teams", "groups"]
+    SUPPORTED_TABLES = ["boards", "items", "users", "workspaces", "teams", "groups", "tags", "updates", "activity_logs"]
     API_URL = "https://api.monday.com/v2"
     DEFAULT_PAGE_SIZE = 50
     DEFAULT_ACTIVITY_LOG_LIMIT = 1000
@@ -101,6 +101,9 @@ class LakeflowConnect:
             "workspaces": self._get_workspaces_schema,
             "teams": self._get_teams_schema,
             "groups": self._get_groups_schema,
+            "tags": self._get_tags_schema,
+            "updates": self._get_updates_schema,
+            "activity_logs": self._get_activity_logs_schema,
         }
 
         return schema_map[table_name]()
@@ -189,6 +192,40 @@ class LakeflowConnect:
             StructField("board_id", LongType(), True),  # Parent board ID
         ])
 
+    def _get_tags_schema(self) -> StructType:
+        """Return the tags table schema."""
+        return StructType([
+            StructField("id", LongType(), False),
+            StructField("name", StringType(), True),
+            StructField("color", StringType(), True),
+            StructField("board_id", LongType(), True),  # Parent board ID
+        ])
+
+    def _get_updates_schema(self) -> StructType:
+        """Return the updates table schema."""
+        return StructType([
+            StructField("id", LongType(), False),
+            StructField("body", StringType(), True),  # HTML content
+            StructField("text_body", StringType(), True),  # Plain text
+            StructField("created_at", StringType(), True),
+            StructField("updated_at", StringType(), True),
+            StructField("creator_id", LongType(), True),
+            StructField("item_id", LongType(), True),
+        ])
+
+    def _get_activity_logs_schema(self) -> StructType:
+        """Return the activity_logs table schema."""
+        return StructType([
+            StructField("id", StringType(), False),
+            StructField("event", StringType(), True),
+            StructField("entity", StringType(), True),
+            StructField("data", StringType(), True),  # JSON string
+            StructField("user_id", LongType(), True),
+            StructField("account_id", StringType(), True),
+            StructField("created_at", StringType(), True),  # Converted from 17-digit Unix
+            StructField("board_id", LongType(), True),  # Parent board ID
+        ])
+
     def read_table_metadata(
         self, table_name: str, table_options: Dict[str, str]
     ) -> dict:
@@ -227,6 +264,18 @@ class LakeflowConnect:
                 "primary_keys": ["id", "board_id"],
                 "ingestion_type": "snapshot",
             },
+            "tags": {
+                "primary_keys": ["id", "board_id"],
+                "ingestion_type": "snapshot",
+            },
+            "updates": {
+                "primary_keys": ["id"],
+                "ingestion_type": "snapshot",
+            },
+            "activity_logs": {
+                "primary_keys": ["id", "board_id"],
+                "ingestion_type": "snapshot",
+            },
         }
 
         return metadata[table_name]
@@ -246,6 +295,9 @@ class LakeflowConnect:
             "workspaces": self._read_workspaces,
             "teams": self._read_teams,
             "groups": self._read_groups,
+            "tags": self._read_tags,
+            "updates": self._read_updates,
+            "activity_logs": self._read_activity_logs,
         }
 
         return read_map[table_name](start_offset, table_options)
@@ -881,6 +933,203 @@ class LakeflowConnect:
             "position": group.get("position"),
             "archived": group.get("archived"),
             "deleted": group.get("deleted"),
+            "board_id": self._to_long(board_id),
+        }
+
+    def _read_tags(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Read tags from boards. Tags are nested within boards,
+        so we need to query boards and extract their tags.
+
+        Table options:
+            - board_ids: Optional comma-separated list of board IDs.
+                         If not provided, discovers all boards.
+        """
+        board_ids_str = table_options.get("board_ids", "")
+
+        # Get board IDs
+        if board_ids_str:
+            board_ids = [bid.strip() for bid in board_ids_str.split(",") if bid.strip()]
+        else:
+            board_ids = self._discover_board_ids()
+
+        if not board_ids:
+            return iter([]), {}
+
+        query = """
+        query($boardIds: [ID!]) {
+            boards(ids: $boardIds) {
+                id
+                tags {
+                    id
+                    name
+                    color
+                }
+            }
+        }
+        """
+
+        def generate_records():
+            # Process boards in batches to avoid query complexity limits
+            batch_size = 25
+            for i in range(0, len(board_ids), batch_size):
+                batch_ids = board_ids[i:i + batch_size]
+
+                variables = {"boardIds": batch_ids}
+                data = self._execute_query(query, variables)
+
+                for board in data.get("boards", []):
+                    board_id = board.get("id")
+                    tags = board.get("tags", [])
+
+                    for tag in tags:
+                        yield self._transform_tag(tag, board_id)
+
+        return generate_records(), {}
+
+    def _transform_tag(self, tag: dict, board_id: str) -> dict:
+        """Transform a tag record for output."""
+        return {
+            "id": self._to_long(tag.get("id")),
+            "name": tag.get("name"),
+            "color": tag.get("color"),
+            "board_id": self._to_long(board_id),
+        }
+
+    def _read_updates(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Read updates (comments) using page-based pagination.
+        """
+        page_size = int(table_options.get("page_size", self.DEFAULT_PAGE_SIZE))
+
+        query = """
+        query($limit: Int, $page: Int) {
+            updates(limit: $limit, page: $page) {
+                id
+                body
+                text_body
+                created_at
+                updated_at
+                creator_id
+                item_id
+            }
+        }
+        """
+
+        def generate_records():
+            page = 1
+            while True:
+                variables = {
+                    "limit": page_size,
+                    "page": page,
+                }
+
+                data = self._execute_query(query, variables)
+                updates = data.get("updates", [])
+
+                if not updates:
+                    break
+
+                for update in updates:
+                    yield self._transform_update(update)
+
+                if len(updates) < page_size:
+                    break
+
+                page += 1
+
+        return generate_records(), {}
+
+    def _transform_update(self, update: dict) -> dict:
+        """Transform an update record for output."""
+        return {
+            "id": self._to_long(update.get("id")),
+            "body": update.get("body"),
+            "text_body": update.get("text_body"),
+            "created_at": update.get("created_at"),
+            "updated_at": update.get("updated_at"),
+            "creator_id": self._to_long(update.get("creator_id")),
+            "item_id": self._to_long(update.get("item_id")),
+        }
+
+    def _read_activity_logs(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Read activity logs from boards. Activity logs are nested within boards.
+
+        Table options:
+            - board_ids: Optional comma-separated list of board IDs.
+                         If not provided, discovers all boards.
+        """
+        board_ids_str = table_options.get("board_ids", "")
+
+        # Get board IDs
+        if board_ids_str:
+            board_ids = [bid.strip() for bid in board_ids_str.split(",") if bid.strip()]
+        else:
+            board_ids = self._discover_board_ids()
+
+        if not board_ids:
+            return iter([]), {}
+
+        query = """
+        query($boardIds: [ID!], $limit: Int) {
+            boards(ids: $boardIds) {
+                id
+                activity_logs(limit: $limit) {
+                    id
+                    event
+                    entity
+                    data
+                    user_id
+                    account_id
+                    created_at
+                }
+            }
+        }
+        """
+
+        def generate_records():
+            # Process boards in batches to avoid query complexity limits
+            batch_size = 10
+            for i in range(0, len(board_ids), batch_size):
+                batch_ids = board_ids[i:i + batch_size]
+
+                variables = {
+                    "boardIds": batch_ids,
+                    "limit": self.DEFAULT_ACTIVITY_LOG_LIMIT,
+                }
+
+                try:
+                    data = self._execute_query(query, variables)
+                except RuntimeError:
+                    # Activity logs may not be available for some boards
+                    continue
+
+                for board in data.get("boards", []):
+                    board_id = board.get("id")
+                    logs = board.get("activity_logs", [])
+
+                    for log in logs:
+                        yield self._transform_activity_log(log, board_id)
+
+        return generate_records(), {}
+
+    def _transform_activity_log(self, log: dict, board_id: str) -> dict:
+        """Transform an activity log record for output."""
+        return {
+            "id": log.get("id"),
+            "event": log.get("event"),
+            "entity": log.get("entity"),
+            "data": log.get("data"),
+            "user_id": self._to_long(log.get("user_id")),
+            "account_id": log.get("account_id"),
+            "created_at": self._convert_activity_timestamp(log.get("created_at", "0")),
             "board_id": self._to_long(board_id),
         }
 

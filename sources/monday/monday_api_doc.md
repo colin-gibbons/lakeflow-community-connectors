@@ -51,14 +51,20 @@ The connector supports the following objects (static list):
 | `workspaces` | None | Workspaces organize boards |
 | `teams` | None | Teams and their members |
 | `groups` | boards | Groups (sections) within boards |
+| `tags` | boards | Tags for categorizing items |
+| `updates` | None | Comments and updates on items |
+| `activity_logs` | boards | Audit trail of all changes |
 
 **Object Hierarchy:**
 - `workspaces` are top-level organizational containers
 - `boards` are top-level containers (may belong to workspaces)
 - `items` belong to `boards` (require board_id to query efficiently)
 - `groups` belong to `boards` (sections that organize items)
+- `tags` belong to `boards` (labels for categorizing items)
+- `activity_logs` belong to `boards` (audit trail of changes)
 - `users` are independent account-level objects
 - `teams` are independent account-level objects
+- `updates` are independent (comments on items)
 
 ## Object Schema
 
@@ -309,6 +315,9 @@ Primary keys are static for all objects:
 | workspaces | `id` |
 | teams | `id` |
 | groups | `id`, `board_id` |
+| tags | `id`, `board_id` |
+| updates | `id` |
+| activity_logs | `id`, `board_id` |
 
 All IDs are unique within the Monday.com account.
 
@@ -322,6 +331,9 @@ All IDs are unique within the Monday.com account.
 | workspaces | `snapshot` | No activity log tracking for workspace changes |
 | teams | `snapshot` | No activity log tracking for team changes |
 | groups | `snapshot` | No activity log tracking for group changes |
+| tags | `snapshot` | No activity log tracking for tag changes |
+| updates | `snapshot` | No activity log tracking for update changes |
+| activity_logs | `snapshot` | Raw audit data, always full refresh |
 
 **Note:** While boards and items have `updated_at` fields, the GraphQL API does not support filtering by these fields directly. The connector uses the Activity Logs API to identify changed entities and then fetches only those records.
 
