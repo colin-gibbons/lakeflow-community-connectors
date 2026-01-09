@@ -1,5 +1,6 @@
 import json
-from typing import Iterator, Dict, List, Optional, Tuple, Union
+from datetime import datetime, timedelta
+from typing import Iterator, Dict, List, Optional, Tuple, Union, Set
 
 import requests
 from pyspark.sql.types import (
@@ -22,6 +23,8 @@ class LakeflowConnect:
     SUPPORTED_TABLES = ["boards", "items", "users"]
     API_URL = "https://api.monday.com/v2"
     DEFAULT_PAGE_SIZE = 50
+    DEFAULT_ACTIVITY_LOG_LIMIT = 1000
+    LOOKBACK_SECONDS = 60  # Lookback window to avoid missing updates
 
     def __init__(self, options: Dict[str, str]) -> None:
         """
@@ -154,17 +157,22 @@ class LakeflowConnect:
     ) -> dict:
         """
         Fetch the metadata of a table.
+
+        CDC is supported for boards and items via Activity Logs API.
+        Users table only supports snapshot mode.
         """
         self._validate_table(table_name)
 
         metadata = {
             "boards": {
                 "primary_keys": ["id"],
-                "ingestion_type": "snapshot",
+                "cursor_field": "updated_at",
+                "ingestion_type": "cdc",
             },
             "items": {
                 "primary_keys": ["id"],
-                "ingestion_type": "snapshot",
+                "cursor_field": "updated_at",
+                "ingestion_type": "cdc",
             },
             "users": {
                 "primary_keys": ["id"],
@@ -194,11 +202,28 @@ class LakeflowConnect:
         self, start_offset: dict, table_options: Dict[str, str]
     ) -> (Iterator[dict], dict):
         """
-        Read boards using page-based pagination.
+        Read boards with CDC support via Activity Logs.
+
+        First sync (no cursor): Full snapshot of all boards.
+        Subsequent syncs: Only boards changed since cursor timestamp.
         """
         page_size = int(table_options.get("page_size", self.DEFAULT_PAGE_SIZE))
         state_filter = table_options.get("state", "all")
 
+        # Check for cursor - if none, do full snapshot
+        cursor = start_offset.get("cursor") if start_offset else None
+
+        if not cursor:
+            # First sync - full snapshot
+            return self._read_boards_snapshot(page_size, state_filter)
+        else:
+            # Incremental sync via activity logs
+            return self._read_boards_cdc(cursor, page_size, state_filter)
+
+    def _read_boards_snapshot(
+        self, page_size: int, state_filter: str
+    ) -> (Iterator[dict], dict):
+        """Read all boards for a full snapshot sync."""
         query = """
         query($limit: Int, $page: Int, $state: State) {
             boards(limit: $limit, page: $page, state: $state) {
@@ -217,31 +242,88 @@ class LakeflowConnect:
         }
         """
 
-        def generate_records():
-            page = 1
-            while True:
-                variables = {
-                    "limit": page_size,
-                    "page": page,
-                    "state": state_filter,
-                }
+        max_updated_at = "1970-01-01T00:00:00Z"
+        all_records = []
 
-                data = self._execute_query(query, variables)
-                boards = data.get("boards", [])
+        page = 1
+        while True:
+            variables = {
+                "limit": page_size,
+                "page": page,
+                "state": state_filter,
+            }
 
-                if not boards:
-                    break
+            data = self._execute_query(query, variables)
+            boards = data.get("boards", [])
 
-                for board in boards:
-                    record = self._transform_board(board)
-                    yield record
+            if not boards:
+                break
 
-                if len(boards) < page_size:
-                    break
+            for board in boards:
+                record = self._transform_board(board)
+                all_records.append(record)
 
-                page += 1
+                # Track max updated_at for cursor
+                board_updated = record.get("updated_at", "")
+                if board_updated and board_updated > max_updated_at:
+                    max_updated_at = board_updated
 
-        return generate_records(), {}
+            if len(boards) < page_size:
+                break
+
+            page += 1
+
+        # Apply lookback to avoid missing near-simultaneous updates
+        if max_updated_at != "1970-01-01T00:00:00Z":
+            new_cursor = self._apply_lookback(max_updated_at)
+        else:
+            new_cursor = None
+
+        return iter(all_records), {"cursor": new_cursor} if new_cursor else {}
+
+    def _read_boards_cdc(
+        self, cursor: str, page_size: int, state_filter: str
+    ) -> (Iterator[dict], dict):
+        """Read only changed boards since cursor using Activity Logs."""
+        # First, get all board IDs to query activity logs
+        all_board_ids = self._discover_board_ids()
+
+        if not all_board_ids:
+            return iter([]), {"cursor": cursor}
+
+        # Query activity logs for board changes since cursor
+        logs = self._query_activity_logs(
+            all_board_ids, from_timestamp=cursor, entity_filter="board"
+        )
+
+        if not logs:
+            # No changes - return same cursor
+            return iter([]), {"cursor": cursor}
+
+        # Extract changed board IDs from logs
+        changed_board_ids = self._extract_board_ids_from_logs(logs)
+
+        # Get max timestamp from logs for new cursor
+        max_timestamp = self._get_max_timestamp(logs, cursor)
+
+        if not changed_board_ids:
+            # Activity but no board IDs found - advance cursor
+            new_cursor = self._apply_lookback(max_timestamp)
+            return iter([]), {"cursor": new_cursor}
+
+        # Fetch full board details for changed boards
+        boards = self._fetch_boards_by_ids(list(changed_board_ids))
+
+        # Update max timestamp from actual board records
+        for board in boards:
+            board_updated = board.get("updated_at", "")
+            if board_updated and board_updated > max_timestamp:
+                max_timestamp = board_updated
+
+        # Apply lookback for next cursor
+        new_cursor = self._apply_lookback(max_timestamp)
+
+        return iter(boards), {"cursor": new_cursor}
 
     def _transform_board(self, board: dict) -> dict:
         """Transform a board record for output."""
@@ -263,7 +345,10 @@ class LakeflowConnect:
         self, start_offset: dict, table_options: Dict[str, str]
     ) -> (Iterator[dict], dict):
         """
-        Read items using cursor-based pagination.
+        Read items with CDC support via Activity Logs.
+
+        First sync (no cursor): Full snapshot of all items.
+        Subsequent syncs: Only items changed since cursor timestamp.
 
         Required table_options:
             - board_ids: Comma-separated list of board IDs to fetch items from.
@@ -272,19 +357,88 @@ class LakeflowConnect:
         page_size = int(table_options.get("page_size", 100))
         board_ids_str = table_options.get("board_ids", "")
 
+        # Get board IDs
         if board_ids_str:
             board_ids = [bid.strip() for bid in board_ids_str.split(",") if bid.strip()]
         else:
             board_ids = self._discover_board_ids()
 
         if not board_ids:
-            return iter([]), None
+            return iter([]), {}
+
+        # Check for cursor - if none, do full snapshot
+        cursor = start_offset.get("cursor") if start_offset else None
+
+        if not cursor:
+            # First sync - full snapshot
+            return self._read_items_snapshot(board_ids, page_size)
+        else:
+            # Incremental sync via activity logs
+            return self._read_items_cdc(board_ids, cursor, page_size)
+
+    def _read_items_snapshot(
+        self, board_ids: List[str], page_size: int
+    ) -> (Iterator[dict], dict):
+        """Read all items for a full snapshot sync."""
+        max_updated_at = "1970-01-01T00:00:00Z"
 
         def generate_records():
+            nonlocal max_updated_at
             for board_id in board_ids:
-                yield from self._read_items_for_board(board_id, page_size)
+                for item in self._read_items_for_board(board_id, page_size):
+                    # Track max updated_at for cursor
+                    item_updated = item.get("updated_at", "")
+                    if item_updated and item_updated > max_updated_at:
+                        max_updated_at = item_updated
+                    yield item
 
-        return generate_records(), {}
+        records = list(generate_records())
+
+        # Apply lookback to avoid missing near-simultaneous updates
+        if max_updated_at != "1970-01-01T00:00:00Z":
+            cursor = self._apply_lookback(max_updated_at)
+        else:
+            cursor = None
+
+        return iter(records), {"cursor": cursor} if cursor else {}
+
+    def _read_items_cdc(
+        self, board_ids: List[str], cursor: str, page_size: int
+    ) -> (Iterator[dict], dict):
+        """Read only changed items since cursor using Activity Logs."""
+        # Query activity logs for item changes since cursor
+        logs = self._query_activity_logs(
+            board_ids, from_timestamp=cursor, entity_filter="pulse"
+        )
+
+        if not logs:
+            # No changes - return same cursor
+            return iter([]), {"cursor": cursor}
+
+        # Extract changed item IDs from logs
+        changed_item_ids = self._extract_item_ids_from_logs(logs)
+
+        # Get max timestamp from logs for new cursor
+        max_timestamp = self._get_max_timestamp(logs, cursor)
+
+        if not changed_item_ids:
+            # Activity but no item IDs found - advance cursor
+            new_cursor = self._apply_lookback(max_timestamp)
+            return iter([]), {"cursor": new_cursor}
+
+        # Fetch full item details for changed items
+        items = self._fetch_items_by_ids(list(changed_item_ids), page_size)
+
+        # Update max timestamp from actual item records
+        for item in items:
+            item_updated = item.get("updated_at", "")
+            if item_updated and item_updated > max_timestamp:
+                max_timestamp = item_updated
+
+        # Apply lookback for next cursor
+        new_cursor = self._apply_lookback(max_timestamp)
+
+        return iter(items), {"cursor": new_cursor}
 
     def _discover_board_ids(self) -> List[str]:
         """Discover all board IDs in the account."""
@@ -507,3 +661,249 @@ class LakeflowConnect:
             return int(value)
         except (ValueError, TypeError):
             return None
+
+    # =========================================================================
+    # Activity Log Methods for CDC Support
+    # =========================================================================
+
+    def _convert_activity_timestamp(self, timestamp: str) -> str:
+        """
+        Convert Monday.com's 17-digit Unix timestamp to ISO8601 format.
+
+        Monday.com activity logs use a 17-digit timestamp (10^-7 seconds).
+        Divide by 10,000,000 to get Unix seconds.
+        """
+        try:
+            seconds = int(timestamp) / 10_000_000
+            dt = datetime.utcfromtimestamp(seconds)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, TypeError, OSError):
+            return "1970-01-01T00:00:00Z"
+
+    def _apply_lookback(self, timestamp: str) -> str:
+        """Apply lookback window to timestamp to avoid missing updates."""
+        try:
+            dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+            dt_with_lookback = dt - timedelta(seconds=self.LOOKBACK_SECONDS)
+            return dt_with_lookback.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, TypeError):
+            return timestamp
+
+    def _query_activity_logs(
+        self,
+        board_ids: List[str],
+        from_timestamp: Optional[str] = None,
+        entity_filter: Optional[str] = None,
+    ) -> List[dict]:
+        """
+        Query activity logs for specified boards.
+
+        Args:
+            board_ids: List of board IDs to query
+            from_timestamp: ISO8601 timestamp to filter from (inclusive)
+            entity_filter: Filter by entity type ("board" or "pulse" for items)
+
+        Returns:
+            List of activity log entries with converted timestamps
+        """
+        query = """
+        query($boardIds: [ID!], $from: ISO8601DateTime, $limit: Int) {
+            boards(ids: $boardIds) {
+                id
+                activity_logs(from: $from, limit: $limit) {
+                    id
+                    event
+                    entity
+                    data
+                    created_at
+                }
+            }
+        }
+        """
+
+        all_logs = []
+
+        # Process boards in batches to avoid query complexity limits
+        batch_size = 10
+        for i in range(0, len(board_ids), batch_size):
+            batch_ids = board_ids[i:i + batch_size]
+
+            variables = {
+                "boardIds": batch_ids,
+                "limit": self.DEFAULT_ACTIVITY_LOG_LIMIT,
+            }
+            if from_timestamp:
+                variables["from"] = from_timestamp
+
+            try:
+                data = self._execute_query(query, variables)
+            except RuntimeError:
+                # Activity logs may not be available for some boards
+                continue
+
+            for board in data.get("boards", []):
+                board_id = board.get("id")
+                for log in board.get("activity_logs", []):
+                    # Convert timestamp and add board_id for context
+                    log_entry = {
+                        "id": log.get("id"),
+                        "event": log.get("event"),
+                        "entity": log.get("entity"),
+                        "data": log.get("data"),
+                        "created_at": self._convert_activity_timestamp(
+                            log.get("created_at", "0")
+                        ),
+                        "board_id": board_id,
+                    }
+
+                    # Filter by entity type if specified
+                    if entity_filter and log_entry.get("entity") != entity_filter:
+                        continue
+
+                    all_logs.append(log_entry)
+
+        return all_logs
+
+    def _extract_item_ids_from_logs(self, logs: List[dict]) -> Set[str]:
+        """
+        Extract unique item IDs from activity logs.
+
+        Item (pulse) activity logs contain the item ID in the 'data' field
+        as a JSON string with a 'pulse_id' or similar field.
+        """
+        item_ids = set()
+
+        for log in logs:
+            if log.get("entity") != "pulse":
+                continue
+
+            data_str = log.get("data", "")
+            if not data_str:
+                continue
+
+            try:
+                data = json.loads(data_str) if isinstance(data_str, str) else data_str
+
+                # Try various possible ID field names
+                for key in ["pulse_id", "item_id", "id", "pulseId", "itemId"]:
+                    if key in data:
+                        item_ids.add(str(data[key]))
+                        break
+
+                # Also check for board_id + pulse_id combination
+                if "board_id" in data and "pulse_id" in data:
+                    item_ids.add(str(data["pulse_id"]))
+
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return item_ids
+
+    def _extract_board_ids_from_logs(self, logs: List[dict]) -> Set[str]:
+        """Extract unique board IDs from activity logs for board-level changes."""
+        board_ids = set()
+
+        for log in logs:
+            if log.get("entity") == "board":
+                # The board_id is added during log processing
+                board_id = log.get("board_id")
+                if board_id:
+                    board_ids.add(str(board_id))
+
+        return board_ids
+
+    def _fetch_items_by_ids(
+        self, item_ids: List[str], page_size: int = 100
+    ) -> List[dict]:
+        """Fetch full item details by item IDs."""
+        if not item_ids:
+            return []
+
+        query = """
+        query($itemIds: [ID!], $limit: Int) {
+            items(ids: $itemIds, limit: $limit) {
+                id
+                name
+                state
+                created_at
+                updated_at
+                creator_id
+                board {
+                    id
+                }
+                group {
+                    id
+                }
+                column_values {
+                    id
+                    text
+                    value
+                }
+                url
+            }
+        }
+        """
+
+        all_items = []
+
+        # Process items in batches (API limit is 100 items per query)
+        for i in range(0, len(item_ids), page_size):
+            batch_ids = item_ids[i:i + page_size]
+
+            variables = {
+                "itemIds": batch_ids,
+                "limit": page_size,
+            }
+
+            try:
+                data = self._execute_query(query, variables)
+                items = data.get("items", [])
+                all_items.extend(self._transform_item(item) for item in items)
+            except RuntimeError:
+                # Some items may have been deleted
+                continue
+
+        return all_items
+
+    def _fetch_boards_by_ids(self, board_ids: List[str]) -> List[dict]:
+        """Fetch full board details by board IDs."""
+        if not board_ids:
+            return []
+
+        query = """
+        query($boardIds: [ID!]) {
+            boards(ids: $boardIds) {
+                id
+                name
+                description
+                state
+                board_kind
+                workspace_id
+                created_at
+                updated_at
+                url
+                items_count
+                permissions
+            }
+        }
+        """
+
+        variables = {"boardIds": board_ids}
+
+        try:
+            data = self._execute_query(query, variables)
+            boards = data.get("boards", [])
+            return [self._transform_board(board) for board in boards]
+        except RuntimeError:
+            return []
+
+    def _get_max_timestamp(self, logs: List[dict], current_max: str) -> str:
+        """Get the maximum created_at timestamp from activity logs."""
+        max_ts = current_max
+
+        for log in logs:
+            log_ts = log.get("created_at", "")
+            if log_ts and log_ts > max_ts:
+                max_ts = log_ts
+
+        return max_ts

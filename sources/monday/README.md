@@ -58,9 +58,25 @@ The Monday.com connector supports the following objects:
 
 | Object | Primary Key | Sync Mode | Description |
 |--------|-------------|-----------|-------------|
-| `boards` | id | Full Refresh | Board metadata including name, description, state, and settings |
-| `items` | id | Full Refresh | Items (rows) from boards with all column values |
+| `boards` | id | CDC (Incremental) | Board metadata including name, description, state, and settings |
+| `items` | id | CDC (Incremental) | Items (rows) from boards with all column values |
 | `users` | id | Full Refresh | Account users with profile information |
+
+### Change Data Capture (CDC)
+
+The `boards` and `items` tables support CDC (Change Data Capture) for incremental syncs. Since Monday.com's GraphQL API does not support filtering by `updated_at`, the connector uses the **Activity Logs API** to identify changes.
+
+**How CDC Works:**
+1. **First sync**: Performs a full snapshot of all data
+2. **Subsequent syncs**: Queries activity logs since the last sync timestamp to identify changed entities
+3. **Fetches only changed records**: Only boards/items that have been modified are retrieved
+
+**Activity Log Details:**
+- Activity logs track all changes to boards and items (creates, updates, deletes)
+- The connector applies a 60-second lookback window to avoid missing near-simultaneous updates
+- `users` table remains snapshot-only as there is no activity log tracking for user changes
+
+**Note**: Activity logs have a retention period. For very old cursors, the connector will fall back to a full snapshot.
 
 ### boards
 

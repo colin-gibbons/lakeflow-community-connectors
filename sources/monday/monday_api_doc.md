@@ -219,11 +219,79 @@ All IDs are unique within the Monday.com account.
 
 | Object | Ingestion Type | Reason |
 |--------|---------------|--------|
-| boards | `snapshot` | No reliable incremental cursor; updated_at available but filtering not supported |
-| items | `snapshot` | Cursor-based pagination but no incremental filter on API |
-| users | `snapshot` | No incremental API endpoint |
+| boards | `cdc` | Uses Activity Logs API to identify changed boards since last sync |
+| items | `cdc` | Uses Activity Logs API to identify changed items since last sync |
+| users | `snapshot` | No activity log tracking for user changes |
 
-**Note:** While boards and items have `updated_at` fields, the GraphQL API does not support filtering by these fields efficiently. Airbyte's approach uses Activity Logs for incremental syncs, but this adds complexity. For hackathon scope, snapshot mode is recommended.
+**Note:** While boards and items have `updated_at` fields, the GraphQL API does not support filtering by these fields directly. The connector uses the Activity Logs API to identify changed entities and then fetches only those records.
+
+## Activity Logs API (CDC Support)
+
+The Activity Logs API enables CDC by tracking all changes to boards and items.
+
+### Activity Log Query
+
+Activity logs are nested within the `boards` query:
+
+```graphql
+query($boardIds: [ID!], $from: ISO8601DateTime, $limit: Int) {
+  boards(ids: $boardIds) {
+    id
+    activity_logs(from: $from, limit: $limit) {
+      id
+      event
+      entity
+      data
+      created_at
+    }
+  }
+}
+```
+
+### Activity Log Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | String! | Unique activity log ID |
+| event | String! | Action type (e.g., `create_pulse`, `update_column_value`, `change_board_settings`) |
+| entity | String! | Entity type: `board` for board changes, `pulse` for item changes |
+| data | String | JSON string with details (contains `pulse_id` for item changes) |
+| created_at | String! | 17-digit Unix timestamp (nanoseconds) |
+
+### Timestamp Conversion
+
+Activity log `created_at` uses 17-digit Unix timestamps:
+
+```python
+# Convert to seconds
+seconds = int(created_at) / 10_000_000
+# Convert to ISO8601
+datetime.utcfromtimestamp(seconds).strftime("%Y-%m-%dT%H:%M:%SZ")
+```
+
+### CDC Flow
+
+**For items:**
+1. Query activity logs with `from` = last cursor timestamp
+2. Filter for `entity = "pulse"` events
+3. Extract item IDs from the `data` field (`pulse_id`)
+4. Fetch full item details for changed items only
+5. Return new cursor = max timestamp from activity logs (with 60s lookback)
+
+**For boards:**
+1. Query activity logs for all accessible boards
+2. Filter for `entity = "board"` events
+3. Extract board IDs that changed
+4. Fetch full board details for changed boards only
+5. Return new cursor = max timestamp from activity logs (with 60s lookback)
+
+### Lookback Window
+
+The connector applies a 60-second lookback when setting the new cursor. This prevents missing updates that occur near the same timestamp due to clock drift or processing delays.
+
+### Rate Limits
+
+Activity logs have the same rate limits as other Monday.com API queries. The connector uses a default limit of 1000 logs per query to balance completeness with API efficiency.
 
 ## Read API for Data Retrieval
 
