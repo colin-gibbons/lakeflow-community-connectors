@@ -1,0 +1,51 @@
+# Monday.com Community Connector Spec
+# This file defines the specification for the connector including
+# connection parameters and allowlist options.
+
+# ============================================================================
+# Connection Parameters
+# These are provided when creating the Unity Catalog connection.
+# ============================================================================
+connection:
+  # ---------------------------------------------------------------------------
+  # Single Authentication Method: Personal API Token
+  # ---------------------------------------------------------------------------
+  parameters:
+    - name: api_token
+      type: string
+      required: true
+      description: >
+        Personal API token for Monday.com authentication.
+        Obtain from: Profile Picture > Developers > My Access Tokens.
+        The token inherits your account permissions - you can only access
+        boards and data that you have permission to view in the Monday.com UI.
+
+# ============================================================================
+# External Options Allowlist
+# These table-specific options must be included in the externalOptionsAllowList
+# parameter of the UC connection to allow them to be passed through.
+# ============================================================================
+external_options_allowlist: "board_ids,page_size,state,kind"
+
+# ---------------------------------------------------------------------------
+# Table-Specific Options Documentation
+# ---------------------------------------------------------------------------
+# board_ids (items table):
+#   Comma-separated list of board IDs to fetch items from.
+#   If not specified, items from all accessible boards will be fetched.
+#   Example: "18394670765,18394670764"
+#
+# page_size (all tables):
+#   Number of records to fetch per page.
+#   Default: 50 for boards/users, 100 for items.
+#   Example: "25"
+#
+# state (boards table):
+#   Filter boards by state.
+#   Values: "active", "all", "archived", "deleted"
+#   Default: "all"
+#
+# kind (users table):
+#   Filter users by type.
+#   Values: "all", "guests", "non_guests", "non_pending"
+#   Default: "all"
