@@ -6,8 +6,6 @@
 # Connection Parameters
 # These are provided when creating the Unity Catalog connection.
 # ============================================================================
-connection_name: gibbons_monday_com
-
 connection:
   # ---------------------------------------------------------------------------
   # Single Authentication Method: Personal API Token
